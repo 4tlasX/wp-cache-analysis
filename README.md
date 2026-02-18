@@ -2,22 +2,6 @@
 
 A CLI tool that analyzes WordPress websites to detect caching configurations, CDNs, and potential conflicts — without requiring backend access. It optionally uses AI to provide improvement suggestions and solutions.
 
-## Features
-
-- Detects 25+ cache plugins (WP Rocket, LiteSpeed, W3TC, etc.)
-- Identifies 14+ CDN providers (Cloudflare, Fastly, BunnyCDN, etc.)
-- Finds server-level caching (Varnish, Nginx FastCGI, managed hosts)
-- **Object cache detection** — probes `/wp-content/object-cache.php` to detect Redis, Memcached, APCu, Docket Cache
-- Detects 50+ plugin conflicts (page caches, SEO plugins, security plugins, optimization overlaps)
-- Double-hit cache testing to verify if caching is actually working
-- **Multi-header cache detection** — checks all cache headers (x-proxy-cache, cf-cache-status, x-cache, etc.)
-- **Image performance analysis** — missing dimensions (CLS), lazy loading, srcset, legacy formats (WebP/AVIF)
-- DNS lookups to identify CDN/WAF providers
-- **WordPress REST API detection** — detects plugins via `/wp-json/` namespaces, fetches server info (PHP, MySQL, memory) from Site Health
-- **SSL/TLS certificate analysis** — issuer, expiration, protocol version, cipher suite
-- **Plugin security scanning via WPScan API (70,000+ vulnerabilities)**
-- **AI analysis via Claude** (default) or local Ollama — with automatic data anonymization
-
 ## Installation
 
 ```bash
