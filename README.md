@@ -1,6 +1,6 @@
 # WP Cache Analysis Agent
 
-A CLI tool that analyzes WordPress websites to detect caching configurations, CDNs, and potential conflicts — without requiring backend access.
+A CLI tool that analyzes WordPress websites to detect caching configurations, CDNs, and potential conflicts — without requiring backend access. It optionally uses AI to provide improvement suggestions and solutions.
 
 ## Features
 
