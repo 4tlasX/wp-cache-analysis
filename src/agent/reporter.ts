@@ -545,7 +545,7 @@ function generateMarkdown(result: AnalysisResult, verbose = false, llmAnalysis?:
 
   // AI Analysis
   if (llmAnalysis) {
-    lines.push('## 🤖 AI Analysis');
+    lines.push('## AI Analysis');
     lines.push('');
     lines.push(`**Score:** ${llmAnalysis.score}/100`);
     lines.push('');
@@ -1000,7 +1000,7 @@ function generateText(result: AnalysisResult, verbose = false, llmAnalysis?: LLM
   if (llmAnalysis) {
     lines.push('');
     lines.push('╔' + '═'.repeat(78) + '╗');
-    lines.push('║' + '  🤖 AI ANALYSIS'.padEnd(78) + '║');
+    lines.push('║' + '  AI ANALYSIS'.padEnd(78) + '║');
     lines.push('╚' + '═'.repeat(78) + '╝');
     lines.push('');
 

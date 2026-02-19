@@ -1,132 +1,227 @@
 /**
  * Autonomous WP Cache Analysis Agent
  *
- * Unlike the linear pipeline, this agent:
- * 1. Navigates the site autonomously, discovering pages to analyze
- * 2. Experiments with different request patterns to test cache behavior
- * 3. Monitors changes over time and adjusts its analysis strategy
- * 4. Makes decisions about what to investigate based on findings
+ * A TRUE autonomous agent where an LLM:
+ * 1. Observes the current state (what we've found so far)
+ * 2. Reasons about what to do next
+ * 3. Picks from available tools/actions
+ * 4. Executes and loops until it decides to stop
+ *
+ * The LLM is the brain - it decides navigation, experiments, when to stop.
  */
 
 import { EventEmitter } from 'node:events';
+import Anthropic from '@anthropic-ai/sdk';
 import { httpClient, type HttpClientResult } from '../mcp-server/tools/http-client.js';
 import { cacheTester, type CacheTestResult } from '../mcp-server/tools/cache-tester.js';
-import { dnsLookup, type DnsLookupResult } from '../mcp-server/tools/dns-lookup.js';
-import { wpSiteHealth, type WPSiteHealthResult } from '../mcp-server/tools/wp-site-health.js';
-import { sslInfo, type SSLInfoResult } from '../mcp-server/tools/ssl-info.js';
+import { dnsLookup } from '../mcp-server/tools/dns-lookup.js';
+import { wpSiteHealth } from '../mcp-server/tools/wp-site-health.js';
 import { analyze, type AnalysisResult } from './analyzer.js';
-import { analyzeWithLLM, buildContextFromResults, type LLMAnalysis, type LLMProvider } from '../llm/analyzer.js';
 
 // ============================================================================
 // Types & Interfaces
 // ============================================================================
 
 export interface AgentConfig {
-  /** Base URL to analyze */
   baseUrl: string;
-  /** Maximum pages to discover and analyze */
-  maxPages: number;
-  /** Maximum depth for link crawling */
-  maxDepth: number;
-  /** Request timeout in milliseconds */
   timeout: number;
-  /** Enable AI-powered analysis */
-  useAI: boolean;
-  /** LLM provider (claude or local) */
-  llmProvider: LLMProvider;
-  /** Anthropic API key */
   apiKey?: string;
-  /** Enable monitoring mode (continuous analysis) */
-  monitorMode: boolean;
-  /** Monitoring interval in milliseconds */
-  monitorInterval: number;
-  /** Maximum monitoring cycles (0 = infinite) */
-  maxMonitorCycles: number;
-  /** Enable cache experimentation */
-  experimentMode: boolean;
-  /** Verbose logging */
+  maxIterations: number;
   verbose: boolean;
 }
 
-export interface PageAnalysis {
+export interface AgentMemory {
+  analyzedPages: Map<string, PageResult>;
+  discoveredUrls: Set<string>;
+  experiments: ExperimentResult[];
+  observations: string[];
+  hypotheses: string[];
+}
+
+export interface PageResult {
   url: string;
-  depth: number;
-  timestamp: Date;
   httpResult: HttpClientResult;
   cacheTest?: CacheTestResult;
-  ruleAnalysis: AnalysisResult;
-  llmAnalysis?: LLMAnalysis;
-  discoveredLinks: string[];
+  analysis: AnalysisResult;
+  timestamp: Date;
 }
 
-export interface CacheExperiment {
+export interface ExperimentResult {
   name: string;
-  description: string;
-  headers: Record<string, string>;
-  expectedBehavior: string;
-  actualResult?: {
-    cacheHit: boolean;
-    ttfb: number;
-    headers: Record<string, string>;
-  };
-  passed?: boolean;
-  insight?: string;
-}
-
-export interface AgentMemory {
-  /** Pages analyzed with their results */
-  pages: Map<string, PageAnalysis>;
-  /** URLs pending analysis */
-  pendingUrls: Set<string>;
-  /** URLs that failed to load */
-  failedUrls: Set<string>;
-  /** Discovered patterns and insights */
-  insights: string[];
-  /** Cache experiments run and their results */
-  experiments: CacheExperiment[];
-  /** Historical snapshots for monitoring mode */
-  snapshots: Array<{
-    timestamp: Date;
-    summary: AgentSummary;
-  }>;
-  /** Learned rules that adjust agent behavior */
-  learnedRules: LearnedRule[];
-}
-
-export interface LearnedRule {
-  id: string;
-  condition: string;
-  action: string;
-  confidence: number;
-  timesApplied: number;
-  successRate: number;
+  hypothesis: string;
+  method: string;
+  result: string;
+  conclusion: string;
 }
 
 export interface AgentSummary {
   pagesAnalyzed: number;
   cacheWorking: boolean;
-  cacheWorkingPages: number;
-  averageTTFB: number;
   detectedPlugins: string[];
   detectedCDNs: string[];
   conflicts: string[];
-  criticalIssues: string[];
+  experiments: ExperimentResult[];
+  finalAnalysis: string;
   recommendations: string[];
-  experimentResults?: {
-    passed: number;
-    failed: number;
-    insights: string[];
-  };
 }
 
-export interface AgentDecision {
-  action: 'analyze_page' | 'run_experiment' | 'deep_dive' | 'skip' | 'stop' | 'adjust_strategy';
-  reason: string;
-  target?: string;
-  priority: number;
-}
+// ============================================================================
+// Tool Definitions for the LLM
+// ============================================================================
 
-type AgentState = 'idle' | 'discovering' | 'analyzing' | 'experimenting' | 'monitoring' | 'thinking' | 'stopped';
+const AGENT_TOOLS: Anthropic.Tool[] = [
+  {
+    name: 'fetch_page',
+    description: 'Fetch a page and analyze its cache configuration. Use this to explore different pages on the site.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        url: {
+          type: 'string',
+          description: 'The full URL to fetch and analyze',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'test_cache_behavior',
+    description: 'Test how the cache responds to specific conditions. Use this to experiment with cache behavior.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        url: {
+          type: 'string',
+          description: 'The URL to test',
+        },
+        test_type: {
+          type: 'string',
+          enum: ['bypass_header', 'vary_encoding', 'with_cookie', 'query_string', 'mobile_ua', 'post_request'],
+          description: 'Type of cache test to run',
+        },
+        hypothesis: {
+          type: 'string',
+          description: 'What you expect to happen and why',
+        },
+      },
+      required: ['url', 'test_type', 'hypothesis'],
+    },
+  },
+  {
+    name: 'dns_lookup',
+    description: 'Perform DNS lookup to detect CDN and hosting provider.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        url: {
+          type: 'string',
+          description: 'The URL to lookup',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'check_wordpress_api',
+    description: 'Query WordPress REST API for site information, plugins, and configuration.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        url: {
+          type: 'string',
+          description: 'The base URL of the WordPress site',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'record_observation',
+    description: 'Record an observation or insight about the cache configuration.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        observation: {
+          type: 'string',
+          description: 'The observation to record',
+        },
+      },
+      required: ['observation'],
+    },
+  },
+  {
+    name: 'form_hypothesis',
+    description: 'Form a hypothesis about the cache behavior that you want to test.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        hypothesis: {
+          type: 'string',
+          description: 'The hypothesis to test',
+        },
+      },
+      required: ['hypothesis'],
+    },
+  },
+  {
+    name: 'complete_analysis',
+    description: 'Call this when you have gathered enough information and are ready to provide final recommendations.',
+    input_schema: {
+      type: 'object' as const,
+      properties: {
+        summary: {
+          type: 'string',
+          description: 'Summary of what you found',
+        },
+        recommendations: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of specific, actionable recommendations',
+        },
+        confidence: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'How confident you are in your analysis',
+        },
+        areas_needing_more_investigation: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Areas that would benefit from more investigation',
+        },
+      },
+      required: ['summary', 'recommendations', 'confidence'],
+    },
+  },
+];
+
+const SYSTEM_PROMPT = `You are an autonomous WordPress cache analysis agent. Your job is to thoroughly investigate a website's caching configuration by:
+
+1. EXPLORING: Fetch and analyze different types of pages (homepage, blog posts, product pages, cart, etc.) to understand how caching varies across the site.
+
+2. EXPERIMENTING: Run cache behavior tests to understand how the cache responds to different conditions. Form hypotheses and test them.
+
+3. REASONING: Connect your findings to build a complete picture. If you notice something unexpected, investigate it.
+
+4. DECIDING: You control what to investigate next. Don't follow a fixed script - adapt based on what you find.
+
+## Guidelines
+
+- Start by fetching the homepage and checking WordPress API to understand the setup
+- Look for links to different page types and analyze them
+- If you detect a caching plugin, test its specific behaviors
+- If cache seems broken, investigate why
+- Form hypotheses and test them with experiments
+- Record observations as you go
+- When you have enough information, complete the analysis
+
+## Important
+
+- You have a limited number of iterations, so be strategic
+- Don't repeat the same tests - each action should give new information
+- If something surprises you, investigate it
+- Think out loud about what you're seeing and why
+
+Remember: You are NOT following a script. You are autonomously investigating based on what you discover.`;
 
 // ============================================================================
 // Autonomous Agent Implementation
@@ -135,320 +230,447 @@ type AgentState = 'idle' | 'discovering' | 'analyzing' | 'experimenting' | 'moni
 export class AutonomousAgent extends EventEmitter {
   private config: AgentConfig;
   private memory: AgentMemory;
-  private state: AgentState = 'idle';
-  private dnsResult?: DnsLookupResult;
-  private siteHealthResult?: WPSiteHealthResult;
-  private sslResult?: SSLInfoResult;
-  private stopRequested = false;
+  private client: Anthropic;
+  private conversationHistory: Anthropic.MessageParam[] = [];
+  private iteration = 0;
+  private completed = false;
+  private finalAnalysis?: {
+    summary: string;
+    recommendations: string[];
+    confidence: string;
+    areasNeedingMoreInvestigation?: string[];
+  };
 
   constructor(config: Partial<AgentConfig> & { baseUrl: string }) {
     super();
+
+    const apiKey = config.apiKey || process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      throw new Error('ANTHROPIC_API_KEY required for autonomous agent');
+    }
+
     this.config = {
       baseUrl: config.baseUrl,
-      maxPages: config.maxPages ?? 10,
-      maxDepth: config.maxDepth ?? 2,
       timeout: config.timeout ?? 30000,
-      useAI: config.useAI ?? false,
-      llmProvider: config.llmProvider ?? 'claude',
-      apiKey: config.apiKey,
-      monitorMode: config.monitorMode ?? false,
-      monitorInterval: config.monitorInterval ?? 60000, // 1 minute default
-      maxMonitorCycles: config.maxMonitorCycles ?? 0,
-      experimentMode: config.experimentMode ?? true,
+      apiKey,
+      maxIterations: config.maxIterations ?? 20,
       verbose: config.verbose ?? false,
     };
 
     this.memory = {
-      pages: new Map(),
-      pendingUrls: new Set([this.config.baseUrl]),
-      failedUrls: new Set(),
-      insights: [],
+      analyzedPages: new Map(),
+      discoveredUrls: new Set([this.config.baseUrl]),
       experiments: [],
-      snapshots: [],
-      learnedRules: [],
+      observations: [],
+      hypotheses: [],
     };
-  }
 
-  // --------------------------------------------------------------------------
-  // Main Agent Loop
-  // --------------------------------------------------------------------------
+    this.client = new Anthropic({ apiKey });
+  }
 
   async run(): Promise<AgentSummary> {
     this.emit('start', { config: this.config });
-    this.log('Agent starting autonomous analysis...');
+    this.log('Autonomous agent starting...');
+    this.log(`Target: ${this.config.baseUrl}`);
+    this.log(`Max iterations: ${this.config.maxIterations}`);
 
-    try {
-      // Phase 1: Initial reconnaissance
-      await this.reconnaissance();
+    // Initial prompt to kick off the agent
+    const initialPrompt = `You are analyzing the WordPress site at: ${this.config.baseUrl}
 
-      // Phase 2: Autonomous discovery and analysis
-      await this.discoverAndAnalyze();
+Begin your autonomous investigation. Start by understanding the basic setup, then explore and experiment based on what you find.
 
-      // Phase 3: Run cache experiments
-      if (this.config.experimentMode) {
-        await this.runExperiments();
-      }
+What would you like to do first?`;
 
-      // Phase 4: Synthesize findings
-      const summary = this.synthesize();
+    this.conversationHistory.push({
+      role: 'user',
+      content: initialPrompt,
+    });
 
-      // Phase 5: Monitoring mode (if enabled)
-      if (this.config.monitorMode && !this.stopRequested) {
-        await this.monitor(summary);
-      }
+    // Main agent loop - LLM decides what to do
+    while (!this.completed && this.iteration < this.config.maxIterations) {
+      this.iteration++;
+      this.log(`\n--- Iteration ${this.iteration}/${this.config.maxIterations} ---`);
 
-      this.emit('complete', { summary });
-      return summary;
+      try {
+        const response = await this.client.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 4096,
+          system: SYSTEM_PROMPT,
+          tools: AGENT_TOOLS,
+          messages: this.conversationHistory,
+        });
 
-    } catch (error) {
-      this.emit('error', { error });
-      throw error;
-    }
-  }
+        // Process the response
+        await this.processResponse(response);
 
-  stop(): void {
-    this.stopRequested = true;
-    this.log('Stop requested, finishing current task...');
-  }
-
-  // --------------------------------------------------------------------------
-  // Phase 1: Reconnaissance
-  // --------------------------------------------------------------------------
-
-  private async reconnaissance(): Promise<void> {
-    this.setState('discovering');
-    this.log('Phase 1: Reconnaissance - gathering site-wide information...');
-
-    // Parallel initial data gathering
-    const [dnsResult, siteHealthResult, sslResult] = await Promise.all([
-      dnsLookup(this.config.baseUrl).catch(() => undefined),
-      wpSiteHealth(this.config.baseUrl, { timeout: this.config.timeout }).catch(() => undefined),
-      sslInfo(this.config.baseUrl, { timeout: this.config.timeout }).catch(() => undefined),
-    ]);
-
-    this.dnsResult = dnsResult;
-    this.siteHealthResult = siteHealthResult;
-    this.sslResult = sslResult;
-
-    // Initial insights from reconnaissance
-    if (siteHealthResult?.isWordPress) {
-      this.addInsight('Confirmed WordPress installation');
-      if (siteHealthResult.restPlugins?.length) {
-        this.addInsight(`Detected ${siteHealthResult.restPlugins.length} plugins via REST API`);
-      }
-    }
-
-    if (dnsResult?.detected.cdn) {
-      this.addInsight(`CDN detected: ${dnsResult.detected.cdn}`);
-    }
-
-    this.emit('reconnaissance_complete', { dns: dnsResult, siteHealth: siteHealthResult, ssl: sslResult });
-  }
-
-  // --------------------------------------------------------------------------
-  // Phase 2: Autonomous Discovery & Analysis
-  // --------------------------------------------------------------------------
-
-  private async discoverAndAnalyze(): Promise<void> {
-    this.setState('analyzing');
-    this.log('Phase 2: Autonomous discovery and analysis...');
-
-    while (this.memory.pendingUrls.size > 0 && !this.stopRequested) {
-      // Make decision about what to do next
-      const decision = await this.decide();
-
-      if (decision.action === 'stop') {
-        this.log(`Stopping: ${decision.reason}`);
-        break;
-      }
-
-      if (decision.action === 'skip') {
-        this.log(`Skipping: ${decision.reason}`);
-        continue;
-      }
-
-      if (decision.action === 'analyze_page' && decision.target) {
-        await this.analyzePage(decision.target, this.getUrlDepth(decision.target));
-      }
-
-      if (decision.action === 'adjust_strategy') {
-        this.adjustStrategy(decision.reason);
-      }
-
-      // Check if we've hit our limits
-      if (this.memory.pages.size >= this.config.maxPages) {
-        this.log(`Reached max pages limit (${this.config.maxPages})`);
+      } catch (error) {
+        this.log(`Error in iteration: ${error}`);
+        this.emit('error', { iteration: this.iteration, error });
         break;
       }
     }
-  }
 
-  private async decide(): Promise<AgentDecision> {
-    this.setState('thinking');
-
-    // Apply learned rules first
-    for (const rule of this.memory.learnedRules) {
-      if (this.evaluateRule(rule)) {
-        rule.timesApplied++;
-        this.log(`Applying learned rule: ${rule.action}`);
-      }
-    }
-
-    // Check stopping conditions
-    if (this.memory.pages.size >= this.config.maxPages) {
-      return { action: 'stop', reason: 'Max pages reached', priority: 0 };
-    }
-
-    if (this.memory.pendingUrls.size === 0) {
-      return { action: 'stop', reason: 'No more URLs to analyze', priority: 0 };
-    }
-
-    // Prioritize URLs based on patterns
-    const prioritizedUrls = this.prioritizeUrls();
-    const nextUrl = prioritizedUrls[0];
-
-    if (!nextUrl) {
-      return { action: 'stop', reason: 'No valid URLs remaining', priority: 0 };
-    }
-
-    // Check if we should adjust strategy based on findings
-    if (this.shouldAdjustStrategy()) {
-      return {
-        action: 'adjust_strategy',
-        reason: this.getStrategyAdjustmentReason(),
-        priority: 10,
+    if (!this.completed) {
+      this.log('Reached max iterations without completing analysis');
+      // Force a completion
+      this.finalAnalysis = {
+        summary: 'Analysis incomplete - reached iteration limit',
+        recommendations: ['Run agent with more iterations for complete analysis'],
+        confidence: 'low',
       };
     }
 
-    return {
-      action: 'analyze_page',
-      target: nextUrl,
-      reason: 'Next prioritized URL',
-      priority: 5,
-    };
+    return this.buildSummary();
   }
 
-  private prioritizeUrls(): string[] {
-    const urls = Array.from(this.memory.pendingUrls);
+  private async processResponse(response: Anthropic.Message): Promise<void> {
+    const assistantContent: Anthropic.ContentBlockParam[] = [];
+    const toolResults: Anthropic.ToolResultBlockParam[] = [];
 
-    return urls.sort((a, b) => {
-      // Prioritize certain page types
-      const scoreA = this.getUrlPriority(a);
-      const scoreB = this.getUrlPriority(b);
-      return scoreB - scoreA;
-    });
-  }
+    for (const block of response.content) {
+      if (block.type === 'text') {
+        this.log(`Agent thinking: ${block.text}`);
+        assistantContent.push({ type: 'text', text: block.text });
+        this.emit('thinking', { text: block.text });
+      } else if (block.type === 'tool_use') {
+        this.log(`Agent action: ${block.name}`);
+        assistantContent.push({
+          type: 'tool_use',
+          id: block.id,
+          name: block.name,
+          input: block.input,
+        });
 
-  private getUrlPriority(url: string): number {
-    let score = 0;
-    const path = new URL(url).pathname.toLowerCase();
-
-    // High priority: pages that likely have different caching
-    if (path === '/' || path === '') score += 10;
-    if (path.includes('/cart')) score += 8;
-    if (path.includes('/checkout')) score += 8;
-    if (path.includes('/my-account')) score += 7;
-    if (path.includes('/shop')) score += 6;
-    if (path.includes('/product')) score += 5;
-    if (path.includes('/blog') || path.includes('/news')) score += 4;
-
-    // Lower priority: static pages
-    if (path.includes('/about')) score += 2;
-    if (path.includes('/contact')) score += 2;
-    if (path.includes('/privacy') || path.includes('/terms')) score += 1;
-
-    // Penalize deep paths
-    const depth = path.split('/').filter(Boolean).length;
-    score -= depth;
-
-    return score;
-  }
-
-  private async analyzePage(url: string, depth: number): Promise<PageAnalysis | null> {
-    this.memory.pendingUrls.delete(url);
-
-    if (this.memory.pages.has(url) || this.memory.failedUrls.has(url)) {
-      return null;
-    }
-
-    this.log(`Analyzing: ${url} (depth: ${depth})`);
-    this.emit('analyzing_page', { url, depth });
-
-    try {
-      // Fetch and analyze
-      const httpResult = await httpClient(url, { timeout: this.config.timeout });
-      if (httpResult.error) {
-        this.memory.failedUrls.add(url);
-        this.emit('page_failed', { url, error: httpResult.error });
-        return null;
-      }
-
-      // Run cache test
-      const cacheTest = await cacheTester(url, { timeout: this.config.timeout });
-
-      // Rule-based analysis
-      const ruleAnalysis = analyze(
-        httpResult,
-        cacheTest,
-        this.dnsResult,
-        undefined,
-        this.siteHealthResult,
-        this.sslResult
-      );
-
-      // Discover links for further analysis
-      const discoveredLinks = this.extractLinks(httpResult.html, url, depth);
-
-      // Add new links to pending if within depth limit
-      if (depth < this.config.maxDepth) {
-        for (const link of discoveredLinks) {
-          if (!this.memory.pages.has(link) && !this.memory.failedUrls.has(link)) {
-            this.memory.pendingUrls.add(link);
-          }
-        }
-      }
-
-      // LLM analysis if enabled
-      let llmAnalysis: LLMAnalysis | undefined;
-      if (this.config.useAI && this.shouldRunLLMAnalysis(ruleAnalysis)) {
-        const context = buildContextFromResults(
-          url,
-          httpResult,
-          cacheTest,
-          this.dnsResult,
-          ruleAnalysis
-        );
-        llmAnalysis = await analyzeWithLLM(context, {
-          provider: this.config.llmProvider,
-          apiKey: this.config.apiKey,
+        // Execute the tool
+        const result = await this.executeTool(block.name, block.input as Record<string, unknown>);
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: result,
         });
       }
+    }
 
-      const pageAnalysis: PageAnalysis = {
-        url,
-        depth,
-        timestamp: new Date(),
-        httpResult,
-        cacheTest,
-        ruleAnalysis,
-        llmAnalysis,
-        discoveredLinks,
-      };
+    // Add assistant message to history
+    this.conversationHistory.push({
+      role: 'assistant',
+      content: assistantContent,
+    });
 
-      this.memory.pages.set(url, pageAnalysis);
-      this.deriveInsights(pageAnalysis);
+    // Add tool results if any
+    if (toolResults.length > 0) {
+      this.conversationHistory.push({
+        role: 'user',
+        content: toolResults,
+      });
+    }
 
-      this.emit('page_analyzed', { pageAnalysis });
-      return pageAnalysis;
-
-    } catch (error) {
-      this.memory.failedUrls.add(url);
-      this.emit('page_failed', { url, error });
-      return null;
+    // Check if we need to continue (if there were tool uses, we need another round)
+    if (response.stop_reason === 'tool_use' && !this.completed) {
+      // Continue the conversation
+      return;
     }
   }
 
-  private extractLinks(html: string, baseUrl: string, _currentDepth: number): string[] {
+  private async executeTool(name: string, input: Record<string, unknown>): Promise<string> {
+    this.emit('tool_use', { name, input });
+
+    try {
+      switch (name) {
+        case 'fetch_page':
+          return await this.toolFetchPage(input.url as string);
+
+        case 'test_cache_behavior':
+          return await this.toolTestCacheBehavior(
+            input.url as string,
+            input.test_type as string,
+            input.hypothesis as string
+          );
+
+        case 'dns_lookup':
+          return await this.toolDnsLookup(input.url as string);
+
+        case 'check_wordpress_api':
+          return await this.toolCheckWordPressApi(input.url as string);
+
+        case 'record_observation':
+          return this.toolRecordObservation(input.observation as string);
+
+        case 'form_hypothesis':
+          return this.toolFormHypothesis(input.hypothesis as string);
+
+        case 'complete_analysis':
+          return this.toolCompleteAnalysis(
+            input.summary as string,
+            input.recommendations as string[],
+            input.confidence as string,
+            input.areas_needing_more_investigation as string[] | undefined
+          );
+
+        default:
+          return `Unknown tool: ${name}`;
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      this.log(`Tool error: ${errorMsg}`);
+      return `Error executing ${name}: ${errorMsg}`;
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Tool Implementations
+  // --------------------------------------------------------------------------
+
+  private async toolFetchPage(url: string): Promise<string> {
+    this.log(`Fetching: ${url}`);
+
+    // Validate URL is on the same domain
+    try {
+      const baseHost = new URL(this.config.baseUrl).hostname;
+      const targetHost = new URL(url).hostname;
+      if (targetHost !== baseHost) {
+        return `Cannot fetch ${url} - different domain than ${this.config.baseUrl}`;
+      }
+    } catch {
+      return `Invalid URL: ${url}`;
+    }
+
+    const httpResult = await httpClient(url, { timeout: this.config.timeout });
+    if (httpResult.error) {
+      return `Failed to fetch ${url}: ${httpResult.error}`;
+    }
+
+    const cacheTest = await cacheTester(url, { timeout: this.config.timeout });
+
+    // Use the rule-based analyzer
+    const analysis = analyze(httpResult, cacheTest);
+
+    // Store results
+    this.memory.analyzedPages.set(url, {
+      url,
+      httpResult,
+      cacheTest,
+      analysis,
+      timestamp: new Date(),
+    });
+
+    // Extract links for discovery
+    const links = this.extractLinks(httpResult.html, url);
+    links.forEach(link => this.memory.discoveredUrls.add(link));
+
+    this.emit('page_analyzed', { url, analysis });
+
+    // Build a useful response for the LLM
+    return JSON.stringify({
+      url,
+      statusCode: httpResult.statusCode,
+      isWordPress: analysis.isWordPress,
+      cacheStatus: {
+        working: analysis.cacheStatus.working,
+        header: analysis.cacheStatus.header,
+        value: analysis.cacheStatus.value,
+        explanation: analysis.cacheStatus.explanation,
+      },
+      timing: {
+        ttfbFirst: cacheTest.doubleHit.firstRequest.ttfb,
+        ttfbSecond: cacheTest.doubleHit.secondRequest.ttfb,
+        improvement: analysis.timing.improvement,
+      },
+      detectedPlugins: analysis.plugins.map(p => p.name),
+      detectedCDNs: analysis.cdns.map(c => c.name),
+      conflicts: analysis.conflicts.map(c => ({
+        plugins: c.plugins,
+        severity: c.severity,
+        reason: c.reason,
+      })),
+      discoveredLinks: links.slice(0, 10), // First 10 links for LLM to consider
+      serverInfo: {
+        server: analysis.serverSpecs.server,
+        hosting: analysis.hosting,
+        phpVersion: analysis.serverSpecs.phpVersion,
+      },
+    }, null, 2);
+  }
+
+  private async toolTestCacheBehavior(
+    url: string,
+    testType: string,
+    hypothesis: string
+  ): Promise<string> {
+    this.log(`Running cache experiment: ${testType} on ${url}`);
+    this.log(`Hypothesis: ${hypothesis}`);
+
+    let headers: Record<string, string> = {};
+    let testUrl = url;
+    let description = '';
+
+    switch (testType) {
+      case 'bypass_header':
+        headers = { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' };
+        description = 'Testing if cache respects no-cache directive';
+        break;
+
+      case 'vary_encoding':
+        headers = { 'Accept-Encoding': 'identity' };
+        description = 'Testing cache behavior with different Accept-Encoding';
+        break;
+
+      case 'with_cookie':
+        headers = { 'Cookie': `wordpress_test_cookie=${Date.now()}` };
+        description = 'Testing if cookies bypass cache';
+        break;
+
+      case 'query_string':
+        testUrl = `${url}${url.includes('?') ? '&' : '?'}cache_bust=${Date.now()}`;
+        description = 'Testing cache behavior with query strings';
+        break;
+
+      case 'mobile_ua':
+        headers = {
+          'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
+        };
+        description = 'Testing if mobile requests are cached separately';
+        break;
+
+      default:
+        return `Unknown test type: ${testType}`;
+    }
+
+    // Make two requests to test cache behavior
+    const firstResult = await httpClient(testUrl, {
+      timeout: this.config.timeout,
+      headers,
+    });
+
+    // Small delay
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    const secondResult = await httpClient(testUrl, {
+      timeout: this.config.timeout,
+      headers,
+    });
+
+    const cacheHitFirst = this.detectCacheHit(firstResult.headers);
+    const cacheHitSecond = this.detectCacheHit(secondResult.headers);
+
+    const experiment: ExperimentResult = {
+      name: testType,
+      hypothesis,
+      method: description,
+      result: `First request: ${cacheHitFirst ? 'HIT' : 'MISS'} (${firstResult.timing.ttfb}ms), Second: ${cacheHitSecond ? 'HIT' : 'MISS'} (${secondResult.timing.ttfb}ms)`,
+      conclusion: '', // LLM will interpret
+    };
+
+    this.memory.experiments.push(experiment);
+    this.emit('experiment_complete', { experiment });
+
+    return JSON.stringify({
+      testType,
+      hypothesis,
+      description,
+      results: {
+        firstRequest: {
+          statusCode: firstResult.statusCode,
+          ttfb: firstResult.timing.ttfb,
+          cacheHit: cacheHitFirst,
+          cacheHeaders: this.extractCacheHeaders(firstResult.headers),
+        },
+        secondRequest: {
+          statusCode: secondResult.statusCode,
+          ttfb: secondResult.timing.ttfb,
+          cacheHit: cacheHitSecond,
+          cacheHeaders: this.extractCacheHeaders(secondResult.headers),
+        },
+      },
+      interpretation: {
+        cacheRespectedBypass: testType === 'bypass_header' && !cacheHitFirst,
+        cookiesBypassCache: testType === 'with_cookie' && !cacheHitSecond,
+        queryStringsCached: testType === 'query_string' && cacheHitSecond,
+        mobileServedSeparately: testType === 'mobile_ua',
+      },
+    }, null, 2);
+  }
+
+  private async toolDnsLookup(url: string): Promise<string> {
+    this.log(`DNS lookup: ${url}`);
+
+    const result = await dnsLookup(url);
+
+    return JSON.stringify({
+      hostname: result.hostname,
+      addresses: result.addresses,
+      cnames: result.cnames,
+      nameservers: result.nameservers,
+      detected: result.detected,
+    }, null, 2);
+  }
+
+  private async toolCheckWordPressApi(url: string): Promise<string> {
+    this.log(`Checking WordPress API: ${url}`);
+
+    const result = await wpSiteHealth(url, { timeout: this.config.timeout });
+
+    return JSON.stringify({
+      isWordPress: result.isWordPress,
+      wpVersion: result.wpVersion,
+      siteName: result.siteName,
+      siteDescription: result.siteDescription,
+      namespaces: result.namespaces,
+      restPlugins: result.restPlugins?.map(p => ({
+        name: p.name,
+        namespace: p.namespace,
+        category: p.category,
+      })),
+      siteHealth: result.siteHealth ? {
+        phpVersion: result.siteHealth.phpVersion,
+        mysqlVersion: result.siteHealth.mysqlVersion,
+        serverSoftware: result.siteHealth.serverSoftware,
+        objectCache: result.siteHealth.objectCache,
+        activePluginsCount: result.siteHealth.activePluginsCount,
+      } : null,
+      error: result.error,
+    }, null, 2);
+  }
+
+  private toolRecordObservation(observation: string): string {
+    this.memory.observations.push(observation);
+    this.log(`Observation recorded: ${observation}`);
+    this.emit('observation', { observation });
+    return `Observation recorded: "${observation}"`;
+  }
+
+  private toolFormHypothesis(hypothesis: string): string {
+    this.memory.hypotheses.push(hypothesis);
+    this.log(`Hypothesis formed: ${hypothesis}`);
+    this.emit('hypothesis', { hypothesis });
+    return `Hypothesis recorded: "${hypothesis}". You can now test this with test_cache_behavior or fetch_page.`;
+  }
+
+  private toolCompleteAnalysis(
+    summary: string,
+    recommendations: string[],
+    confidence: string,
+    areasNeedingMoreInvestigation?: string[]
+  ): string {
+    this.completed = true;
+    this.finalAnalysis = {
+      summary,
+      recommendations,
+      confidence,
+      areasNeedingMoreInvestigation,
+    };
+
+    this.log('Analysis completed');
+    this.emit('complete', { summary, recommendations, confidence });
+
+    return 'Analysis complete. The agent will now generate the final report.';
+  }
+
+  // --------------------------------------------------------------------------
+  // Helpers
+  // --------------------------------------------------------------------------
+
+  private extractLinks(html: string, baseUrl: string): string[] {
     const links: string[] = [];
     const base = new URL(baseUrl);
     const linkRegex = /<a[^>]+href=["']([^"']+)["']/gi;
@@ -457,184 +679,24 @@ export class AutonomousAgent extends EventEmitter {
     while ((match = linkRegex.exec(html)) !== null) {
       try {
         const href = match[1];
-        // Skip anchors, javascript, mailto, tel
         if (href.startsWith('#') || href.startsWith('javascript:') ||
             href.startsWith('mailto:') || href.startsWith('tel:')) {
           continue;
         }
 
         const resolved = new URL(href, baseUrl);
-
-        // Only include same-origin links
-        if (resolved.origin === base.origin) {
-          // Normalize URL (remove trailing slash, fragments)
+        if (resolved.hostname === base.hostname) {
           const normalized = resolved.origin + resolved.pathname.replace(/\/$/, '');
-          if (!links.includes(normalized) && normalized !== baseUrl) {
+          if (!links.includes(normalized) && !this.memory.analyzedPages.has(normalized)) {
             links.push(normalized);
           }
         }
       } catch {
-        // Invalid URL, skip
+        // Invalid URL
       }
     }
 
     return links;
-  }
-
-  private shouldRunLLMAnalysis(analysis: AnalysisResult): boolean {
-    // Run LLM analysis if there are interesting findings
-    return (
-      analysis.conflicts.length > 0 ||
-      analysis.plugins.length > 2 ||
-      !analysis.cacheStatus.working ||
-      (analysis.imageAnalysis?.imagesWithIssues ?? 0) > 5
-    );
-  }
-
-  private deriveInsights(page: PageAnalysis): void {
-    const { ruleAnalysis, cacheTest } = page;
-
-    // Cache behavior insights
-    if (!ruleAnalysis.cacheStatus.working) {
-      this.addInsight(`Page not cached: ${new URL(page.url).pathname}`);
-    }
-
-    // Conflict detection
-    if (ruleAnalysis.conflicts.length > 0) {
-      for (const conflict of ruleAnalysis.conflicts) {
-        this.addInsight(`Conflict: ${conflict.plugins.join(' + ')} - ${conflict.reason}`);
-      }
-    }
-
-    // Performance insights
-    if (cacheTest && cacheTest.doubleHit.firstRequest.ttfb > 1000) {
-      this.addInsight(`Slow TTFB (${cacheTest.doubleHit.firstRequest.ttfb}ms) on ${new URL(page.url).pathname}`);
-    }
-
-    // Learn from patterns
-    this.learnFromPage(page);
-  }
-
-  private learnFromPage(page: PageAnalysis): void {
-    // Example: Learn that certain paths are never cached
-    const path = new URL(page.url).pathname;
-
-    if (!page.ruleAnalysis.cacheStatus.working) {
-      if (path.includes('/cart') || path.includes('/checkout') || path.includes('/my-account')) {
-        this.addLearnedRule({
-          id: 'dynamic_paths',
-          condition: 'path contains cart/checkout/my-account',
-          action: 'expect_no_cache',
-          confidence: 0.9,
-          timesApplied: 0,
-          successRate: 1.0,
-        });
-      }
-    }
-  }
-
-  // --------------------------------------------------------------------------
-  // Phase 3: Cache Experiments
-  // --------------------------------------------------------------------------
-
-  private async runExperiments(): Promise<void> {
-    this.setState('experimenting');
-    this.log('Phase 3: Running cache experiments...');
-
-    const experiments = this.generateExperiments();
-
-    for (const experiment of experiments) {
-      if (this.stopRequested) break;
-
-      this.log(`Running experiment: ${experiment.name}`);
-      await this.runExperiment(experiment);
-      this.memory.experiments.push(experiment);
-    }
-
-    this.emit('experiments_complete', { experiments: this.memory.experiments });
-  }
-
-  private generateExperiments(): CacheExperiment[] {
-    const experiments: CacheExperiment[] = [
-      {
-        name: 'Cache Bypass Test',
-        description: 'Test if cache can be bypassed with no-cache header',
-        headers: { 'Cache-Control': 'no-cache' },
-        expectedBehavior: 'Should bypass cache and hit origin',
-      },
-      {
-        name: 'Vary Header Test',
-        description: 'Test cache behavior with different Accept-Encoding',
-        headers: { 'Accept-Encoding': 'identity' },
-        expectedBehavior: 'May serve different cached version',
-      },
-      {
-        name: 'Cookie Bypass Test',
-        description: 'Test if cookies affect caching',
-        headers: { 'Cookie': 'test_cookie=1' },
-        expectedBehavior: 'May bypass cache for authenticated content',
-      },
-      {
-        name: 'Query String Test',
-        description: 'Test cache behavior with query parameters',
-        headers: {},
-        expectedBehavior: 'Cache may vary by query string',
-      },
-    ];
-
-    // Add plugin-specific experiments based on detected plugins
-    const homepage = this.memory.pages.get(this.config.baseUrl);
-    if (homepage) {
-      const plugins = homepage.ruleAnalysis.plugins;
-
-      if (plugins.some(p => p.slug === 'wp-rocket')) {
-        experiments.push({
-          name: 'WP Rocket Mobile Cache',
-          description: 'Test mobile-specific caching',
-          headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X)' },
-          expectedBehavior: 'Should serve mobile-optimized cached version',
-        });
-      }
-
-      if (plugins.some(p => p.slug === 'litespeed-cache')) {
-        experiments.push({
-          name: 'LiteSpeed ESI Test',
-          description: 'Test Edge Side Includes behavior',
-          headers: { 'X-LSCACHE': '1' },
-          expectedBehavior: 'Should process ESI blocks',
-        });
-      }
-    }
-
-    return experiments;
-  }
-
-  private async runExperiment(experiment: CacheExperiment): Promise<void> {
-    const url = experiment.name === 'Query String Test'
-      ? `${this.config.baseUrl}?cache_test=${Date.now()}`
-      : this.config.baseUrl;
-
-    try {
-      const result = await httpClient(url, {
-        timeout: this.config.timeout,
-        headers: experiment.headers,
-      });
-
-      const cacheHit = this.detectCacheHit(result.headers);
-
-      experiment.actualResult = {
-        cacheHit,
-        ttfb: result.timing.ttfb,
-        headers: result.headers,
-      };
-
-      // Determine if experiment passed and derive insights
-      this.analyzeExperiment(experiment);
-
-      this.emit('experiment_complete', { experiment });
-    } catch (error) {
-      experiment.insight = `Experiment failed: ${error instanceof Error ? error.message : 'Unknown error'}`;
-    }
   }
 
   private detectCacheHit(headers: Record<string, string>): boolean {
@@ -652,322 +714,56 @@ export class AutonomousAgent extends EventEmitter {
     return false;
   }
 
-  private analyzeExperiment(experiment: CacheExperiment): void {
-    if (!experiment.actualResult) return;
+  private extractCacheHeaders(headers: Record<string, string>): Record<string, string> {
+    const cacheRelated = [
+      'cache-control', 'x-cache', 'cf-cache-status', 'x-varnish',
+      'x-proxy-cache', 'x-kinsta-cache', 'x-wpe-cached', 'x-litespeed-cache',
+      'age', 'expires', 'vary', 'etag'
+    ];
 
-    const { cacheHit, ttfb } = experiment.actualResult;
-
-    switch (experiment.name) {
-      case 'Cache Bypass Test':
-        experiment.passed = !cacheHit;
-        experiment.insight = cacheHit
-          ? 'Cache does NOT respect no-cache header - may need server config'
-          : 'Cache correctly bypasses on no-cache header';
-        break;
-
-      case 'Cookie Bypass Test':
-        experiment.passed = !cacheHit;
-        experiment.insight = cacheHit
-          ? 'Cache serves cached content even with cookies - check cookie exclusions'
-          : 'Cache correctly excludes requests with cookies';
-        break;
-
-      case 'Query String Test':
-        // Both outcomes are valid depending on config
-        experiment.passed = true;
-        experiment.insight = cacheHit
-          ? 'Query strings are cached (good for CDN, verify exclusions for dynamic params)'
-          : 'Query strings bypass cache (conservative but may reduce hit rate)';
-        break;
-
-      default:
-        experiment.passed = true;
-        experiment.insight = `TTFB: ${ttfb}ms, Cache: ${cacheHit ? 'HIT' : 'MISS'}`;
+    const result: Record<string, string> = {};
+    for (const header of cacheRelated) {
+      if (headers[header]) {
+        result[header] = headers[header];
+      }
     }
-
-    if (experiment.insight) {
-      this.addInsight(`Experiment "${experiment.name}": ${experiment.insight}`);
-    }
+    return result;
   }
 
-  // --------------------------------------------------------------------------
-  // Phase 4: Synthesis
-  // --------------------------------------------------------------------------
-
-  private synthesize(): AgentSummary {
-    this.log('Phase 4: Synthesizing findings...');
-
-    const pages = Array.from(this.memory.pages.values());
+  private buildSummary(): AgentSummary {
+    const pages = Array.from(this.memory.analyzedPages.values());
     const allPlugins = new Set<string>();
     const allCDNs = new Set<string>();
     const allConflicts: string[] = [];
-    const criticalIssues: string[] = [];
-    const recommendations: string[] = [];
 
     let cacheWorkingCount = 0;
-    let totalTTFB = 0;
 
     for (const page of pages) {
-      const { ruleAnalysis, llmAnalysis } = page;
+      page.analysis.plugins.forEach(p => allPlugins.add(p.name));
+      page.analysis.cdns.forEach(c => allCDNs.add(c.name));
 
-      // Aggregate plugins and CDNs
-      ruleAnalysis.plugins.forEach(p => allPlugins.add(p.name));
-      ruleAnalysis.cdns.forEach(c => allCDNs.add(c.name));
-
-      // Aggregate conflicts
-      for (const conflict of ruleAnalysis.conflicts) {
+      for (const conflict of page.analysis.conflicts) {
         const key = `${conflict.plugins.join(' + ')}: ${conflict.reason}`;
         if (!allConflicts.includes(key)) {
           allConflicts.push(key);
         }
       }
 
-      // Count cache status
-      if (ruleAnalysis.cacheStatus.working) {
+      if (page.analysis.cacheStatus.working) {
         cacheWorkingCount++;
       }
-
-      // Aggregate TTFB
-      if (page.cacheTest) {
-        totalTTFB += page.cacheTest.doubleHit.firstRequest.ttfb;
-      }
-
-      // Aggregate LLM findings
-      if (llmAnalysis) {
-        for (const issue of llmAnalysis.issues) {
-          if (issue.severity === 'high' && !criticalIssues.includes(issue.title)) {
-            criticalIssues.push(issue.title);
-          }
-        }
-        for (const rec of llmAnalysis.recommendations) {
-          if (rec.priority <= 2 && !recommendations.includes(rec.title)) {
-            recommendations.push(rec.title);
-          }
-        }
-      }
     }
-
-    // Experiment results
-    const passedExperiments = this.memory.experiments.filter(e => e.passed).length;
-    const failedExperiments = this.memory.experiments.filter(e => e.passed === false).length;
-    const experimentInsights = this.memory.experiments
-      .filter(e => e.insight)
-      .map(e => e.insight!);
 
     return {
       pagesAnalyzed: pages.length,
-      cacheWorking: cacheWorkingCount > pages.length / 2,
-      cacheWorkingPages: cacheWorkingCount,
-      averageTTFB: pages.length > 0 ? Math.round(totalTTFB / pages.length) : 0,
+      cacheWorking: pages.length > 0 && cacheWorkingCount > pages.length / 2,
       detectedPlugins: Array.from(allPlugins),
       detectedCDNs: Array.from(allCDNs),
       conflicts: allConflicts,
-      criticalIssues,
-      recommendations: recommendations.length > 0 ? recommendations : this.generateRecommendations(),
-      experimentResults: this.config.experimentMode ? {
-        passed: passedExperiments,
-        failed: failedExperiments,
-        insights: experimentInsights,
-      } : undefined,
+      experiments: this.memory.experiments,
+      finalAnalysis: this.finalAnalysis?.summary || 'Analysis incomplete',
+      recommendations: this.finalAnalysis?.recommendations || [],
     };
-  }
-
-  private generateRecommendations(): string[] {
-    const recommendations: string[] = [];
-    const homepage = this.memory.pages.get(this.config.baseUrl);
-
-    if (homepage) {
-      if (!homepage.ruleAnalysis.cacheStatus.working) {
-        recommendations.push('Enable page caching - no cache detected on homepage');
-      }
-
-      if (homepage.ruleAnalysis.cdns.length === 0) {
-        recommendations.push('Consider adding a CDN for global performance');
-      }
-
-      if (homepage.ruleAnalysis.plugins.length === 0) {
-        recommendations.push('Install a caching plugin (WP Rocket, LiteSpeed Cache, or W3 Total Cache)');
-      }
-    }
-
-    return recommendations;
-  }
-
-  // --------------------------------------------------------------------------
-  // Phase 5: Monitoring
-  // --------------------------------------------------------------------------
-
-  private async monitor(initialSummary: AgentSummary): Promise<void> {
-    this.setState('monitoring');
-    this.log('Phase 5: Entering monitoring mode...');
-
-    let cycle = 0;
-    this.memory.snapshots.push({ timestamp: new Date(), summary: initialSummary });
-
-    while (!this.stopRequested) {
-      cycle++;
-
-      if (this.config.maxMonitorCycles > 0 && cycle > this.config.maxMonitorCycles) {
-        this.log(`Reached max monitoring cycles (${this.config.maxMonitorCycles})`);
-        break;
-      }
-
-      this.log(`Monitoring cycle ${cycle}, waiting ${this.config.monitorInterval / 1000}s...`);
-      await this.sleep(this.config.monitorInterval);
-
-      if (this.stopRequested) break;
-
-      // Re-analyze homepage
-      this.memory.pendingUrls.add(this.config.baseUrl);
-      await this.analyzePage(this.config.baseUrl, 0);
-
-      const newSummary = this.synthesize();
-      this.memory.snapshots.push({ timestamp: new Date(), summary: newSummary });
-
-      // Compare with previous
-      const changes = this.detectChanges(initialSummary, newSummary);
-      if (changes.length > 0) {
-        this.log('Changes detected:');
-        changes.forEach(c => this.log(`  - ${c}`));
-        this.emit('changes_detected', { changes, summary: newSummary });
-
-        // Adjust strategy based on changes
-        this.adjustStrategyBasedOnChanges(changes);
-      }
-    }
-  }
-
-  private detectChanges(prev: AgentSummary, curr: AgentSummary): string[] {
-    const changes: string[] = [];
-
-    if (prev.cacheWorking !== curr.cacheWorking) {
-      changes.push(`Cache status changed: ${prev.cacheWorking ? 'working' : 'not working'} → ${curr.cacheWorking ? 'working' : 'not working'}`);
-    }
-
-    const ttfbDiff = curr.averageTTFB - prev.averageTTFB;
-    if (Math.abs(ttfbDiff) > 100) {
-      changes.push(`Average TTFB ${ttfbDiff > 0 ? 'increased' : 'decreased'} by ${Math.abs(ttfbDiff)}ms`);
-    }
-
-    const newPlugins = curr.detectedPlugins.filter(p => !prev.detectedPlugins.includes(p));
-    if (newPlugins.length > 0) {
-      changes.push(`New plugins detected: ${newPlugins.join(', ')}`);
-    }
-
-    const removedPlugins = prev.detectedPlugins.filter(p => !curr.detectedPlugins.includes(p));
-    if (removedPlugins.length > 0) {
-      changes.push(`Plugins removed: ${removedPlugins.join(', ')}`);
-    }
-
-    return changes;
-  }
-
-  private adjustStrategyBasedOnChanges(changes: string[]): void {
-    for (const change of changes) {
-      if (change.includes('Cache status changed')) {
-        // Re-run experiments to understand the change
-        this.addInsight('Cache status changed - will re-run experiments next cycle');
-      }
-
-      if (change.includes('TTFB increased')) {
-        // Add rule to investigate performance
-        this.addLearnedRule({
-          id: 'ttfb_investigation',
-          condition: 'TTFB increased significantly',
-          action: 'investigate_performance',
-          confidence: 0.8,
-          timesApplied: 0,
-          successRate: 0,
-        });
-      }
-    }
-  }
-
-  // --------------------------------------------------------------------------
-  // Strategy & Learning
-  // --------------------------------------------------------------------------
-
-  private shouldAdjustStrategy(): boolean {
-    // Adjust if we're finding too many failed URLs
-    const failureRate = this.memory.failedUrls.size /
-      (this.memory.pages.size + this.memory.failedUrls.size + 1);
-
-    return failureRate > 0.3;
-  }
-
-  private getStrategyAdjustmentReason(): string {
-    const failureRate = this.memory.failedUrls.size /
-      (this.memory.pages.size + this.memory.failedUrls.size + 1);
-
-    if (failureRate > 0.3) {
-      return 'High failure rate - adjusting URL selection';
-    }
-
-    return 'General strategy adjustment';
-  }
-
-  private adjustStrategy(reason: string): void {
-    this.log(`Adjusting strategy: ${reason}`);
-
-    if (reason.includes('failure rate')) {
-      // Remove pending URLs that match failed patterns
-      const failedPaths = Array.from(this.memory.failedUrls)
-        .map(u => new URL(u).pathname);
-
-      for (const pending of this.memory.pendingUrls) {
-        const path = new URL(pending).pathname;
-        if (failedPaths.some(fp => path.startsWith(fp.split('/').slice(0, -1).join('/')))) {
-          this.memory.pendingUrls.delete(pending);
-        }
-      }
-    }
-  }
-
-  private evaluateRule(rule: LearnedRule): boolean {
-    // Simple rule evaluation - could be expanded with more sophisticated logic
-    switch (rule.id) {
-      case 'dynamic_paths':
-        return true; // Always apply path-based rules
-      case 'ttfb_investigation':
-        return this.memory.snapshots.length > 1;
-      default:
-        return rule.confidence > 0.5;
-    }
-  }
-
-  private addLearnedRule(rule: LearnedRule): void {
-    const existing = this.memory.learnedRules.find(r => r.id === rule.id);
-    if (existing) {
-      existing.confidence = Math.min(1, existing.confidence + 0.1);
-    } else {
-      this.memory.learnedRules.push(rule);
-    }
-  }
-
-  // --------------------------------------------------------------------------
-  // Helpers
-  // --------------------------------------------------------------------------
-
-  private getUrlDepth(url: string): number {
-    // Find which discovered link led to this URL and calculate depth
-    for (const [pageUrl, page] of this.memory.pages) {
-      if (page.discoveredLinks.includes(url)) {
-        return page.depth + 1;
-      }
-    }
-    return 0;
-  }
-
-  private setState(state: AgentState): void {
-    this.state = state;
-    this.emit('state_change', { state });
-  }
-
-  private addInsight(insight: string): void {
-    if (!this.memory.insights.includes(insight)) {
-      this.memory.insights.push(insight);
-      this.emit('insight', { insight });
-    }
   }
 
   private log(message: string): void {
@@ -977,23 +773,12 @@ export class AutonomousAgent extends EventEmitter {
     this.emit('log', { message });
   }
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  // --------------------------------------------------------------------------
-  // Public Accessors
-  // --------------------------------------------------------------------------
-
-  getState(): AgentState {
-    return this.state;
-  }
-
+  // Public accessors
   getMemory(): AgentMemory {
     return this.memory;
   }
 
-  getInsights(): string[] {
-    return this.memory.insights;
+  getIteration(): number {
+    return this.iteration;
   }
 }
